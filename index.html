@@ -31,9 +31,11 @@
     const { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer,
             PieChart, Pie, Cell } = Recharts;
 
-    // ─── API KEY — paste yours here if deploying standalone ──────────────────────
-    // Leave blank to use fallback mode (LSB extraction still fully works)
-    const ANTHROPIC_API_KEY = "";
+    // ─── API KEY STORE — set once via Nav input, used everywhere ─────────────────
+    // This is module-level so all components share the same key.
+    let gApiKey = "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";
+    const getKey = () => gApiKey;
+    const setKey = k => { gApiKey = k.trim(); };
 
     // ─── CONSTANTS ────────────────────────────────────────────────────────────────
     const PALETTE = {
@@ -47,30 +49,6 @@
       text:  "#E2E8F0",
       muted: "#64748B",
     };
-
-    const SCAN_TIMELINE = [
-      { t:"00:00", scans:12 }, { t:"02:00", scans:28 }, { t:"04:00", scans:18 },
-      { t:"06:00", scans:45 }, { t:"08:00", scans:72 }, { t:"10:00", scans:91 },
-      { t:"12:00", scans:134},{ t:"14:00", scans:108},{ t:"16:00", scans:156},
-      { t:"18:00", scans:120},{ t:"20:00", scans:88 }, { t:"22:00", scans:64 },
-    ];
-
-    const RISK_DIST = [
-      { name:"Safe",      value:61, color:PALETTE.green },
-      { name:"Suspicious",value:28, color:PALETTE.amber },
-      { name:"High Risk", value:11, color:PALETTE.red   },
-    ];
-
-    const BULK_DEMO = [
-      { name:"recon_img_001.png",  score:82, status:"Suspicious" },
-      { name:"data_dump_a.jpg",    score:94, status:"High Risk"  },
-      { name:"meeting_notes.png",  score:12, status:"Safe"       },
-      { name:"profile_export.bmp", score:67, status:"Suspicious" },
-      { name:"screenshot_3.png",   score:8,  status:"Safe"       },
-      { name:"invoice_scan.jpg",   score:91, status:"High Risk"  },
-      { name:"wallpaper_hd.png",   score:23, status:"Safe"       },
-      { name:"capture_feed.bmp",   score:78, status:"Suspicious" },
-    ];
 
     const COMMON_PASSWORDS = [
       "password","123456","password1","qwerty","abc123","letmein","monkey",
@@ -317,14 +295,26 @@
     }
 
     // ─── CLAUDE API ───────────────────────────────────────────────────────────────
-    async function analyzeWithClaude(imageBase64, fileName) {
+    // Accepts a full dataURL — detects mime type automatically
+    async function analyzeWithClaude(imageDataUrl, fileName) {
       const systemPrompt = `You are StegoShield AI, an expert steganography detection engine.
 Analyze the provided image and return ONLY a JSON object (no markdown, no preamble) with this exact schema:
 {"riskScore":<int 0-100>,"indicators":[<3-5 short anomaly strings>],"hotspots":[<4-7 objects: {"x":<0-1>,"y":<0-1>,"r":<0.1-0.35>,"intensity":<0-1>}>],"summary":"<2-3 sentence forensic analysis>"}
 High risk = 70-95, suspicious = 30-69, safe = 5-29.`;
 
-      const headers = { "Content-Type":"application/json", "anthropic-version":"2023-06-01", "anthropic-dangerous-direct-browser-access":"true" };
-      if (ANTHROPIC_API_KEY) headers["x-api-key"] = ANTHROPIC_API_KEY;
+      // Parse mime + base64 from dataURL
+      let mime = "image/jpeg", base64 = imageDataUrl;
+      if (imageDataUrl.startsWith("data:")) {
+        const semi = imageDataUrl.indexOf(";");
+        mime   = imageDataUrl.substring(5, semi);
+        base64 = imageDataUrl.substring(semi + 8);
+      }
+      const allowed = ["image/jpeg","image/png","image/gif","image/webp"];
+      const mediaType = allowed.includes(mime) ? mime : "image/png";
+
+      const key = getKey();
+      if (!key) throw new Error("no_key");
+      const headers = { "Content-Type":"application/json", "anthropic-version":"2023-06-01", "anthropic-dangerous-direct-browser-access":"true", "x-api-key": key };
 
       const resp = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
@@ -334,13 +324,16 @@ High risk = 70-95, suspicious = 30-69, safe = 5-29.`;
           max_tokens: 1000,
           system: systemPrompt,
           messages: [{ role:"user", content:[
-            { type:"image", source:{ type:"base64", media_type:"image/jpeg", data:imageBase64 } },
+            { type:"image", source:{ type:"base64", media_type: mediaType, data: base64 } },
             { type:"text",  text:`Analyze "${fileName}" for steganographic content.` }
           ]}]
         })
       });
 
-      if (!resp.ok) throw new Error(`API ${resp.status}`);
+      if (!resp.ok) {
+        const errBody = await resp.json().catch(() => ({}));
+        throw new Error(`API ${resp.status}: ${errBody?.error?.message || "unknown"}`);
+      }
       const data = await resp.json();
       const text = data.content?.find(b => b.type === "text")?.text || "{}";
       return JSON.parse(text.replace(/```json|```/g, "").trim());
@@ -365,68 +358,149 @@ High risk = 70-95, suspicious = 30-69, safe = 5-29.`;
     };
 
     // ─── LSB EXTRACTION ENGINE ────────────────────────────────────────────────────
+    // Chi-square (Westfeld-Pfitzmann) is valid ONLY for lossless formats (PNG/BMP).
+    // JPEG compression already equalises pixel-pair frequencies → chi ≈ 1-3 on
+    // ALL JPEGs whether stego or not. Applying it to JPEG = 100% false positives.
+    //
+    // Text detection uses "longest consecutive readable run" not overall ratio,
+    // because stego messages appear as a clean run at the start then garbage after.
     function extractLSB(imageDataUrl) {
       return new Promise(resolve => {
         const img = new window.Image();
         img.onload = () => {
-          const canvas = document.createElement("canvas");
-          canvas.width = img.width; canvas.height = img.height;
-          const ctx = canvas.getContext("2d");
-          ctx.drawImage(img, 0, 0);
-          const { data } = ctx.getImageData(0, 0, img.width, img.height);
+          // Detect format from dataURL mime type
+          const mime = imageDataUrl.substring(5, imageDataUrl.indexOf(";"));
+          const isJpeg = mime === "image/jpeg" || mime === "image/jpg";
 
+          const canvas = document.createElement("canvas");
+          const maxDim = 800;
+          const sc = Math.min(1, maxDim / Math.max(img.width, img.height, 1));
+          canvas.width  = Math.max(1, Math.floor(img.width  * sc));
+          canvas.height = Math.max(1, Math.floor(img.height * sc));
+          const ctx = canvas.getContext("2d");
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          const { data } = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+          // ── 1. Collect LSB bits (R,G,B interleaved — skip Alpha) ─────────────
+          const maxBits = Math.min(data.length * 3 / 4, 98304);
           const bits = [];
-          for (let i = 0; i < data.length && bits.length < 65536; i++) {
+          for (let i = 0; i < data.length && bits.length < maxBits; i++) {
             if ((i % 4) !== 3) bits.push(data[i] & 1);
           }
 
-          const bytes = [];
-          for (let i = 0; i+7 < bits.length; i += 8) {
-            let byte = 0;
-            for (let b = 0; b < 8; b++) byte = (byte << 1) | bits[i+b];
-            bytes.push(byte);
+          // ── 2. Decode — try MSB-first and LSB-first ───────────────────────────
+          const tryDecode = lsbFirst => {
+            const chars = [];
+            for (let i = 0; i + 7 < bits.length && chars.length < 600; i += 8) {
+              let b = 0;
+              if (lsbFirst) { for (let j = 7; j >= 0; j--) b = (b<<1)|bits[i+j]; }
+              else          { for (let j = 0; j < 8;  j++) b = (b<<1)|bits[i+j]; }
+              if (b === 0 && chars.length > 24) break;
+              chars.push(b);
+            }
+            return chars;
+          };
+          const msbChars  = tryDecode(false);
+          const lsbChars  = tryDecode(true);
+
+          // ── 3. Find longest consecutive run of printable ASCII ────────────────
+          // This is the key insight: a hidden message shows as a long clean run
+          // at the start of the decoded stream. Natural image noise never produces
+          // runs longer than ~5-8 chars by random chance.
+          const longestRun = chars => {
+            let best = "", current = "";
+            for (const c of chars) {
+              if (c >= 32 && c <= 126) { current += String.fromCharCode(c); }
+              else if (c === 10 || c === 13 || c === 9) { current += " "; }
+              else { if (current.trim().length > best.trim().length) best = current; current = ""; }
+            }
+            if (current.trim().length > best.trim().length) best = current;
+            return best;
+          };
+
+          const msbRun = longestRun(msbChars);
+          const lsbRun = longestRun(lsbChars);
+          const bestRun = msbRun.trim().length >= lsbRun.trim().length ? msbRun : lsbRun;
+          const runLength = bestRun.trim().length;
+
+          // Readable if longest consecutive run >= 18 printable chars
+          // By random chance: probability of 18+ consecutive printable ASCII
+          // chars is (95/256)^18 ≈ 0.000003 — essentially impossible naturally
+          const isReadable = runLength >= 18;
+
+          // Full decoded text for display
+          const toText = chars => chars.map(c =>
+            (c >= 32 && c <= 126) ? String.fromCharCode(c) :
+            (c === 10||c === 13||c === 9) ? " " : "·"
+          ).join("");
+          const decodedText = toText(msbChars);
+
+          // ── 4. Chi-square on R channel — ONLY meaningful for lossless formats ─
+          let chiScore = 999; // default = no evidence = safe
+          if (!isJpeg) {
+            const freqR = new Array(256).fill(0);
+            for (let i = 0; i < data.length; i += 4) freqR[data[i]]++;
+            let chiSum = 0, chiN = 0;
+            for (let i = 0; i < 254; i += 2) {
+              const t = freqR[i] + freqR[i+1];
+              if (t < 5) continue;
+              const e = t / 2;
+              chiSum += ((freqR[i]-e)**2 + (freqR[i+1]-e)**2) / e;
+              chiN++;
+            }
+            chiScore = chiN > 0 ? chiSum / chiN : 999;
+            // Natural PNG: chi typically 50–10000+
+            // LSB stego PNG at full capacity: chi ≈ 0.01–1.0
+            // LSB stego PNG at 50% capacity: chi ≈ 2–8
           }
 
-          let text = "", readableCount = 0;
-          for (let i = 0; i < Math.min(bytes.length, 512); i++) {
-            const c = bytes[i];
-            if (c === 0 && i > 8) break;
-            if (c >= 32 && c <= 126) { text += String.fromCharCode(c); readableCount++; }
-            else if (c === 10 || c === 13 || c === 9) text += String.fromCharCode(c);
-            else text += "·";
-          }
+          // ── 5. isEncrypted: PNG/BMP only, chi must be low ─────────────────────
+          // chi < 4 means pixel pairs are suspiciously equalised
+          const isEncrypted = !isReadable && !isJpeg && chiScore < 4;
 
-          const readableRatio = readableCount / Math.max(text.length, 1);
-          const isReadable = readableRatio > 0.72 && text.trim().length > 3;
-
-          const freq = new Array(256).fill(0);
-          bytes.slice(0, 256).forEach(b => freq[b]++);
-          const entropy = freq.reduce((acc, f) => {
-            if (f === 0) return acc;
-            const p = f / 256;
-            return acc - p * Math.log2(p);
-          }, 0);
-          const isEncrypted = !isReadable && entropy > 6.8;
+          // Raw bytes for display
+          const decoded = msbChars.slice(0, 64);
 
           resolve({
-            bytes: bytes.slice(0, 64),
-            text: text.slice(0, 400),
-            isReadable, isEncrypted,
-            entropy: entropy.toFixed(2),
-            readableRatio: (readableRatio * 100).toFixed(0),
+            bytes:        decoded,
+            text:         decodedText.slice(0, 400),
+            isReadable,   isEncrypted,
+            readableRatio: String(runLength),   // repurposed: longest run length
+            chiScore:     chiScore === 999 ? "N/A" : chiScore.toFixed(1),
+            spatialCorr:  "—",
+            stegoSignal:  isReadable ? "text" : isEncrypted ? "chi" : "none",
+            entropy:      "—",
+            isJpeg,
           });
         };
         img.src = imageDataUrl;
       });
     }
 
+    // Score is driven by concrete evidence only.
+    // JPEGs: chi is always low, so only text detection applies → default SAFE.
+    // PNGs:  chi + text detection.
     function lsbToRiskScore(lsb) {
-      const entropy = parseFloat(lsb.entropy);
-      const rr = parseFloat(lsb.readableRatio);
-      if (lsb.isReadable)   return Math.min(95, 72 + Math.round(rr * .25));
-      if (lsb.isEncrypted)  return Math.min(90, Math.round(40 + (entropy - 6.8) * 30));
-      const base = Math.round((entropy / 8) * 55);
-      return Math.max(3, Math.min(45, base));
+      // Definitive: found readable message
+      if (lsb.isReadable) {
+        const runLen = parseInt(lsb.readableRatio) || 18;
+        return Math.min(95, 70 + Math.min(25, Math.round((runLen - 18) * 0.8)));
+      }
+
+      // Definitive: encrypted payload in lossless image (chi confirmed)
+      if (lsb.isEncrypted) return 78;
+
+      // JPEG with no readable text → always SAFE (chi is meaningless for JPEG)
+      if (lsb.isJpeg) return 8;
+
+      // PNG/BMP, no encrypted pattern detected — score by chi only
+      const chi = parseFloat(lsb.chiScore);
+      if (isNaN(chi) || chi >= 50) return 6;   // very natural distribution
+      if (chi >= 20) return 9;
+      if (chi >= 8)  return 14;
+      if (chi >= 4)  return 20;
+      // chi 2–4: borderline, NOT enough alone without the corr signal
+      return 24;
     }
 
     function readFileAsDataURL(file) {
@@ -455,18 +529,29 @@ High risk = 70-95, suspicious = 30-69, safe = 5-29.`;
 
     // ─── NAV ──────────────────────────────────────────────────────────────────────
     function Nav({ page, setPage }) {
+      const [showKeyInput, setShowKeyInput] = useState(false);
+      const [keyVal, setKeyVal] = useState(gApiKey);
+      const [saved, setSaved] = useState(!!gApiKey);
+
+      const saveKey = () => {
+        setKey(keyVal);
+        setSaved(!!keyVal);
+        setShowKeyInput(false);
+      };
+
       const links = [
         { id:"landing",   label:"Home"      },
         { id:"dashboard", label:"Dashboard" },
         { id:"scanner",   label:"Scanner"   },
         { id:"bulk",      label:"Bulk Scan" },
       ];
+
       return (
         <nav style={{
           position:"fixed", top:0, left:0, right:0, zIndex:100,
           display:"flex", alignItems:"center", justifyContent:"space-between",
-          padding:"0 40px", height:"60px",
-          background:"rgba(8,12,20,0.9)",
+          padding:"0 32px", height:"60px",
+          background:"rgba(8,12,20,0.92)",
           borderBottom:`1px solid ${PALETTE.border}`,
           backdropFilter:"blur(20px)",
         }}>
@@ -481,14 +566,72 @@ High risk = 70-95, suspicious = 30-69, safe = 5-29.`;
             </span>
             <span className="tag" style={{ background:`${PALETTE.blue}22`, color:PALETTE.blue, marginLeft:4 }}>AI</span>
           </div>
-          <div style={{ display:"flex", gap:32 }}>
+
+          <div style={{ display:"flex", gap:28 }}>
             {links.map(l => (
               <span key={l.id} className={`nav-link ${page===l.id?"active":""}`} onClick={() => setPage(l.id)}>{l.label}</span>
             ))}
           </div>
-          <button className="btn-primary" style={{ padding:"7px 18px", fontSize:12 }} onClick={() => setPage("scanner")}>
-            + New Scan
-          </button>
+
+          <div style={{ display:"flex", alignItems:"center", gap:10, position:"relative" }}>
+            {/* API key indicator */}
+            <div
+              onClick={() => setShowKeyInput(!showKeyInput)}
+              title={saved ? "API key configured — click to change" : "Click to add Anthropic API key"}
+              style={{
+                display:"flex", alignItems:"center", gap:6, cursor:"pointer",
+                padding:"5px 10px", borderRadius:6,
+                border:`1px solid ${saved ? PALETTE.green+"44" : PALETTE.amber+"44"}`,
+                background: saved ? `${PALETTE.green}0D` : `${PALETTE.amber}0D`,
+                transition:"all .2s",
+              }}
+            >
+              <span style={{ fontSize:10 }}>{saved ? "🔑" : "🔓"}</span>
+              <span className="mono" style={{ fontSize:10, color: saved ? PALETTE.green : PALETTE.amber }}>
+                {saved ? "API: Active" : "API: Not Set"}
+              </span>
+            </div>
+
+            {/* Inline key popover */}
+            {showKeyInput && (
+              <div style={{
+                position:"absolute", top:"calc(100% + 12px)", right:0,
+                width:320, padding:16, borderRadius:10, zIndex:200,
+                background:"rgba(10,16,28,0.98)", border:`1px solid ${PALETTE.border}`,
+                boxShadow:`0 16px 48px rgba(0,0,0,.6)`,
+              }}>
+                <div style={{ fontSize:12, color:PALETTE.muted, marginBottom:8, letterSpacing:".04em" }}>
+                  Anthropic API Key
+                </div>
+                <input
+                  type="password"
+                  placeholder="sk-ant-api03-…"
+                  value={keyVal}
+                  onChange={e => setKeyVal(e.target.value)}
+                  onKeyDown={e => e.key === "Enter" && saveKey()}
+                  autoFocus
+                  style={{
+                    width:"100%", padding:"9px 12px", borderRadius:6,
+                    background:"rgba(0,0,0,.5)", border:`1px solid ${PALETTE.border}`,
+                    color:PALETTE.text, fontFamily:"'JetBrains Mono',monospace", fontSize:12,
+                    outline:"none", marginBottom:10,
+                  }}
+                />
+                <div style={{ display:"flex", gap:8 }}>
+                  <button className="btn-primary" style={{ flex:1, padding:"7px 0", fontSize:12 }} onClick={saveKey}>Save Key</button>
+                  <button className="btn-ghost" style={{ padding:"7px 14px", fontSize:12 }} onClick={() => setShowKeyInput(false)}>Cancel</button>
+                </div>
+                <div style={{ fontSize:10, color:PALETTE.muted, marginTop:8, lineHeight:1.5 }}>
+                  Key used only for direct Anthropic API calls from your browser.{" "}
+                  <a href="https://console.anthropic.com" target="_blank" style={{ color:PALETTE.blue }}>Get one free →</a>
+                </div>
+              </div>
+            )}
+
+            <button className="btn-primary" style={{ padding:"7px 18px", fontSize:12 }} onClick={() => setPage("scanner")}>
+              + New Scan
+            </button>
+          </div>
         </nav>
       );
     }
@@ -612,6 +755,46 @@ High risk = 70-95, suspicious = 30-69, safe = 5-29.`;
       );
     }
 
+    // ─── LIVE THREAT INTEL ────────────────────────────────────────────────────────
+    async function fetchThreatIntel() {
+      const key = getKey();
+      if (!key) throw new Error("no_key");
+
+      const resp = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+          "x-api-key": key,
+        },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-20250514",
+          max_tokens: 1500,
+          tools: [{ type: "web_search_20250305", name: "web_search" }],
+          system: `You are a cybersecurity threat intelligence analyst. 
+Search for the latest real-world steganography-related security incidents, data exfiltration via images, 
+and covert channel cyber threats from 2025. 
+After searching, return ONLY a JSON array (no markdown, no preamble) with exactly 4 items:
+[{"title":"<short headline>","summary":"<1-2 sentence description of the real incident or threat>","severity":"critical|high|medium","source":"<domain name only, e.g. bleepingcomputer.com>","date":"<approximate date like 'Mar 2025'>"}]
+Use real search results. Each item should be a distinct, real event.`,
+          messages: [{ role: "user", content: "Search for the 4 most recent real steganography or image-based data exfiltration cyber threats in 2025." }]
+        })
+      });
+
+      if (!resp.ok) throw new Error(`API ${resp.status}`);
+      const data = await resp.json();
+
+      // Extract text from all content blocks (web_search responses span multiple blocks)
+      const textBlocks = (data.content || []).filter(b => b.type === "text");
+      const fullText = textBlocks.map(b => b.text).join("\n");
+      const clean = fullText.replace(/```json|```/g, "").trim();
+      // Find the JSON array in the response
+      const match = clean.match(/\[[\s\S]*\]/);
+      if (!match) throw new Error("no_json");
+      return JSON.parse(match[0]);
+    }
+
     // ─── DASHBOARD ────────────────────────────────────────────────────────────────
     // All numbers are derived from scanHistory — the real array of completed scans.
     function Dashboard({ setPage, scanHistory }) {
@@ -621,16 +804,12 @@ High risk = 70-95, suspicious = 30-69, safe = 5-29.`;
       const safe       = scanHistory.filter(s => scoreLabel(s.score) === "Safe").length;
       const avgScore   = total ? Math.round(scanHistory.reduce((a,s) => a + s.score, 0) / total) : 0;
 
-      // Build a timeline: last 10 scans as sequential data points labeled by time
-      const timelineData = scanHistory.slice(-10).map((s, i) => ({
+      const timelineData = scanHistory.slice(-12).map((s, i) => ({
         t: new Date(s.timestamp).toLocaleTimeString([], { hour:"2-digit", minute:"2-digit" }),
-        scans: i + 1,
         score: s.score,
+        idx: i + 1,
       }));
-      // Pad to at least 2 points so the chart renders
-      const chartData = timelineData.length >= 2 ? timelineData : [];
 
-      // Risk distribution from real data — only show if we have scans
       const riskDist = total > 0 ? [
         { name:"Safe",      value: Math.round(safe/total*100),       color:PALETTE.green },
         { name:"Suspicious",value: Math.round(suspicious/total*100), color:PALETTE.amber },
@@ -638,13 +817,12 @@ High risk = 70-95, suspicious = 30-69, safe = 5-29.`;
       ].filter(d => d.value > 0) : [];
 
       const stats = [
-        { label:"Total Scanned",   val:total,      color:PALETTE.blue  },
-        { label:"Suspicious",      val:suspicious, color:PALETTE.amber },
-        { label:"High Risk",       val:highRisk,   color:PALETTE.red   },
-        { label:"Avg Risk Score",  val:avgScore,   color:PALETTE.green, suffix:"%" },
+        { label:"Total Scanned",  val:total,      color:PALETTE.blue  },
+        { label:"Suspicious",     val:suspicious, color:PALETTE.amber },
+        { label:"High Risk",      val:highRisk,   color:PALETTE.red   },
+        { label:"Avg Risk Score", val:avgScore,   color:PALETTE.green, suffix:"%" },
       ];
 
-      // Format "X min ago / just now" from timestamp
       const timeAgo = ts => {
         const d = Math.floor((Date.now() - ts) / 1000);
         if (d < 10) return "just now";
@@ -652,145 +830,254 @@ High risk = 70-95, suspicious = 30-69, safe = 5-29.`;
         return `${Math.floor(d/60)}m ago`;
       };
 
-      const EmptyState = () => (
-        <div style={{ padding:"60px 0", textAlign:"center" }}>
-          <div style={{ fontSize:36, marginBottom:16, opacity:.2 }}>⬡</div>
-          <div style={{ fontSize:14, color:PALETTE.muted, marginBottom:8 }}>No scans yet this session</div>
-          <div style={{ fontSize:13, color:PALETTE.muted, opacity:.6, marginBottom:24 }}>Run the Scanner or Bulk Scan to populate real data here.</div>
-          <button className="btn-primary" style={{ fontSize:13 }} onClick={() => setPage("scanner")}>Start Scanning →</button>
-        </div>
-      );
+      // ── Live Threat Intel state ──
+      const [intel, setIntel]         = useState(null);   // null | "loading" | array | "error" | "no_key"
+      const [intelTs, setIntelTs]     = useState(null);
+      const fetchIntel = async () => {
+        setIntel("loading");
+        try {
+          const items = await fetchThreatIntel();
+          setIntel(items);
+          setIntelTs(Date.now());
+        } catch (e) {
+          setIntel(e.message === "no_key" ? "no_key" : "error");
+        }
+      };
+      // Auto-fetch once when dashboard mounts if key is available
+      useEffect(() => { if (getKey()) fetchIntel(); }, []);
+
+      const sevColor = s => s === "critical" ? PALETTE.red : s === "high" ? PALETTE.amber : PALETTE.blue;
+      const sevLabel = s => s === "critical" ? "CRITICAL" : s === "high" ? "HIGH" : "MEDIUM";
 
       return (
-        <div style={{ padding:"80px 40px 40px", maxWidth:1200, margin:"0 auto" }}>
+        <div style={{ padding:"80px 40px 60px", maxWidth:1200, margin:"0 auto" }}>
+          {/* Header */}
           <div style={{ marginBottom:32, display:"flex", justifyContent:"space-between", alignItems:"flex-end", flexWrap:"wrap", gap:12 }}>
             <div>
               <h1 className="bebas" style={{ fontSize:44, color:PALETTE.text, letterSpacing:".03em" }}>Threat Dashboard</h1>
               <p style={{ color:PALETTE.muted, fontSize:14, marginTop:4 }}>
                 Live session intelligence •{" "}
                 {total > 0
-                  ? <span className="mono" style={{ color:PALETTE.blue }}>{total} scan{total!==1?"s":""} this session</span>
-                  : <span style={{ color:PALETTE.muted }}>no scans yet</span>}
+                  ? <><span className="mono" style={{ color:PALETTE.blue }}>{total} scan{total!==1?"s":""}</span> this session</>
+                  : <span style={{ color:PALETTE.muted }}>no scans yet — run Scanner or Bulk Scan</span>}
               </p>
             </div>
-            {total === 0 && (
-              <button className="btn-primary" style={{ fontSize:13 }} onClick={() => setPage("scanner")}>Run First Scan →</button>
-            )}
+            <button className="btn-primary" style={{ fontSize:13 }} onClick={() => setPage("scanner")}>+ New Scan</button>
           </div>
 
-          {/* Stat cards — always show, animate to 0 if empty */}
+          {/* Stat cards */}
           <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(240px,1fr))", gap:16, marginBottom:32 }}>
             {stats.map((s,i) => (
               <div key={i} className="glass glass-hover" style={{ borderRadius:12, padding:24, animation:`fadeUp .5s ${i*.08}s both`, opacity:0 }}>
                 <div style={{ fontSize:12, color:PALETTE.muted, letterSpacing:".08em", textTransform:"uppercase", marginBottom:12 }}>{s.label}</div>
-                <div className="mono" style={{ fontSize:36, fontWeight:700, color:total > 0 ? s.color : PALETTE.muted, lineHeight:1 }}>
+                <div className="mono" style={{ fontSize:36, fontWeight:700, color:total>0?s.color:PALETTE.muted, lineHeight:1 }}>
                   {total > 0 ? <><AnimatedNumber target={s.val} />{s.suffix||""}</> : "—"}
                 </div>
-                <div style={{ marginTop:8, fontSize:12, color:PALETTE.muted }}>
-                  {total > 0 ? `this session` : "no data yet"}
-                </div>
+                <div style={{ marginTop:8, fontSize:12, color:PALETTE.muted }}>{total > 0 ? "this session" : "no data yet"}</div>
               </div>
             ))}
           </div>
 
-          {total === 0 ? <div className="glass" style={{ borderRadius:12 }}><EmptyState /></div> : (
-            <>
-              {/* Charts row */}
-              <div style={{ display:"grid", gridTemplateColumns:"2fr 1fr", gap:16, marginBottom:32 }}>
-                <div className="glass" style={{ borderRadius:12, padding:24 }}>
-                  <div style={{ fontSize:13, color:PALETTE.muted, marginBottom:20, letterSpacing:".06em", textTransform:"uppercase" }}>
-                    Scan Activity — this session
-                  </div>
-                  {chartData.length >= 2 ? (
-                    <ResponsiveContainer width="100%" height={200}>
-                      <AreaChart data={chartData}>
-                        <defs>
-                          <linearGradient id="scanGrad" x1="0" y1="0" x2="0" y2="1">
-                            <stop offset="0%"   stopColor={PALETTE.blue} stopOpacity={.4} />
-                            <stop offset="100%" stopColor={PALETTE.blue} stopOpacity={0}  />
-                          </linearGradient>
-                        </defs>
-                        <XAxis dataKey="t" tick={{ fill:PALETTE.muted, fontSize:11, fontFamily:"JetBrains Mono" }} axisLine={false} tickLine={false} />
-                        <YAxis tick={{ fill:PALETTE.muted, fontSize:11, fontFamily:"JetBrains Mono" }} axisLine={false} tickLine={false} />
-                        <Tooltip
-                          contentStyle={{ background:PALETTE.panel, border:`1px solid ${PALETTE.border}`, borderRadius:8, fontSize:12, fontFamily:"JetBrains Mono" }}
-                          labelStyle={{ color:PALETTE.muted }}
-                          formatter={(v, name) => name === "score" ? [`${v}%`, "Risk Score"] : [v, "Cumulative"]}
-                        />
-                        <Area type="monotone" dataKey="score" stroke={PALETTE.blue} strokeWidth={2} fill="url(#scanGrad)" dot={{ r:3, fill:PALETTE.blue }} />
-                      </AreaChart>
-                    </ResponsiveContainer>
-                  ) : (
-                    <div style={{ height:200, display:"flex", alignItems:"center", justifyContent:"center", color:PALETTE.muted, fontSize:13 }}>
-                      Scan at least 2 images to see the chart
-                    </div>
-                  )}
-                </div>
-
-                <div className="glass" style={{ borderRadius:12, padding:24 }}>
-                  <div style={{ fontSize:13, color:PALETTE.muted, marginBottom:20, letterSpacing:".06em", textTransform:"uppercase" }}>Risk Distribution</div>
-                  {riskDist.length > 0 ? (
-                    <>
-                      <ResponsiveContainer width="100%" height={160}>
-                        <PieChart>
-                          <Pie data={riskDist} cx="50%" cy="50%" innerRadius={44} outerRadius={72} dataKey="value" strokeWidth={0}>
-                            {riskDist.map((d,i) => <Cell key={i} fill={d.color} opacity={.85} />)}
-                          </Pie>
-                          <Tooltip contentStyle={{ background:PALETTE.panel, border:`1px solid ${PALETTE.border}`, borderRadius:8, fontSize:12 }} formatter={v => [`${v}%`]} />
-                        </PieChart>
-                      </ResponsiveContainer>
-                      <div style={{ display:"flex", justifyContent:"center", gap:12, marginTop:8, flexWrap:"wrap" }}>
-                        {riskDist.map((d,i) => (
-                          <div key={i} style={{ display:"flex", alignItems:"center", gap:5, fontSize:12 }}>
-                            <div style={{ width:8, height:8, borderRadius:2, background:d.color }} />
-                            <span style={{ color:PALETTE.muted }}>{d.name}</span>
-                            <span className="mono" style={{ color:d.color }}>{d.value}%</span>
-                          </div>
-                        ))}
-                      </div>
-                    </>
-                  ) : (
-                    <div style={{ height:160, display:"flex", alignItems:"center", justifyContent:"center", color:PALETTE.muted, fontSize:13 }}>No data yet</div>
-                  )}
-                </div>
-              </div>
-
-              {/* Recent scans table — all real entries, newest first */}
+          {/* Charts row — only if we have data */}
+          {total > 0 && (
+            <div style={{ display:"grid", gridTemplateColumns:"2fr 1fr", gap:16, marginBottom:32 }}>
               <div className="glass" style={{ borderRadius:12, padding:24 }}>
-                <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:20 }}>
-                  <div style={{ fontSize:13, color:PALETTE.muted, letterSpacing:".06em", textTransform:"uppercase" }}>
-                    Recent Scans
-                  </div>
-                  <span className="mono" style={{ fontSize:11, color:PALETTE.muted }}>{total} total</span>
-                </div>
-                <table>
-                  <thead><tr><th>File</th><th>Risk Score</th><th>Status</th><th>Payload</th><th>Time</th></tr></thead>
-                  <tbody>
-                    {[...scanHistory].reverse().slice(0, 10).map((r, i) => (
-                      <tr key={i} style={{ animation:`fadeUp .3s ${i*.04}s both`, opacity:0 }}>
-                        <td><span className="mono" style={{ color:PALETTE.text, fontSize:12 }}>{r.name}</span></td>
-                        <td>
-                          <div style={{ display:"flex", alignItems:"center", gap:10 }}>
-                            <div className="progress-bar" style={{ width:80 }}>
-                              <div className="progress-fill" style={{ width:`${r.score}%`, background:scoreColor(r.score) }} />
-                            </div>
-                            <span className="mono" style={{ color:scoreColor(r.score), fontSize:12 }}>{r.score}%</span>
-                          </div>
-                        </td>
-                        <td><span className="tag" style={{ background:`${scoreColor(r.score)}22`, color:scoreColor(r.score) }}>{scoreLabel(r.score)}</span></td>
-                        <td>
-                          <span className="mono" style={{ fontSize:11, color: r.lsbPayload === "plaintext" ? PALETTE.red : r.lsbPayload === "encrypted" ? PALETTE.amber : PALETTE.muted }}>
-                            {r.lsbPayload === "plaintext" ? "⚠ plaintext" : r.lsbPayload === "encrypted" ? "🔒 encrypted" : "◎ none"}
-                          </span>
-                        </td>
-                        <td><span style={{ color:PALETTE.muted, fontSize:12 }}>{timeAgo(r.timestamp)}</span></td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+                <div style={{ fontSize:13, color:PALETTE.muted, marginBottom:20, letterSpacing:".06em", textTransform:"uppercase" }}>Risk Score — this session</div>
+                {timelineData.length >= 2 ? (
+                  <ResponsiveContainer width="100%" height={200}>
+                    <AreaChart data={timelineData}>
+                      <defs>
+                        <linearGradient id="scanGrad" x1="0" y1="0" x2="0" y2="1">
+                          <stop offset="0%"   stopColor={PALETTE.blue} stopOpacity={.4} />
+                          <stop offset="100%" stopColor={PALETTE.blue} stopOpacity={0}  />
+                        </linearGradient>
+                      </defs>
+                      <XAxis dataKey="t" tick={{ fill:PALETTE.muted, fontSize:11, fontFamily:"JetBrains Mono" }} axisLine={false} tickLine={false} />
+                      <YAxis domain={[0,100]} tick={{ fill:PALETTE.muted, fontSize:11, fontFamily:"JetBrains Mono" }} axisLine={false} tickLine={false} />
+                      <Tooltip
+                        contentStyle={{ background:PALETTE.panel, border:`1px solid ${PALETTE.border}`, borderRadius:8, fontSize:12, fontFamily:"JetBrains Mono" }}
+                        labelStyle={{ color:PALETTE.muted }}
+                        formatter={v => [`${v}%`, "Risk Score"]}
+                      />
+                      <Area type="monotone" dataKey="score" stroke={PALETTE.blue} strokeWidth={2} fill="url(#scanGrad)" dot={{ r:3, fill:PALETTE.blue }} />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <div style={{ height:200, display:"flex", alignItems:"center", justifyContent:"center", color:PALETTE.muted, fontSize:13 }}>Scan at least 2 images to see the chart</div>
+                )}
               </div>
-            </>
+
+              <div className="glass" style={{ borderRadius:12, padding:24 }}>
+                <div style={{ fontSize:13, color:PALETTE.muted, marginBottom:20, letterSpacing:".06em", textTransform:"uppercase" }}>Risk Distribution</div>
+                {riskDist.length > 0 ? (
+                  <>
+                    <ResponsiveContainer width="100%" height={160}>
+                      <PieChart>
+                        <Pie data={riskDist} cx="50%" cy="50%" innerRadius={44} outerRadius={72} dataKey="value" strokeWidth={0}>
+                          {riskDist.map((d,i) => <Cell key={i} fill={d.color} opacity={.85} />)}
+                        </Pie>
+                        <Tooltip contentStyle={{ background:PALETTE.panel, border:`1px solid ${PALETTE.border}`, borderRadius:8, fontSize:12 }} formatter={v => [`${v}%`]} />
+                      </PieChart>
+                    </ResponsiveContainer>
+                    <div style={{ display:"flex", justifyContent:"center", gap:12, marginTop:8, flexWrap:"wrap" }}>
+                      {riskDist.map((d,i) => (
+                        <div key={i} style={{ display:"flex", alignItems:"center", gap:5, fontSize:12 }}>
+                          <div style={{ width:8, height:8, borderRadius:2, background:d.color }} />
+                          <span style={{ color:PALETTE.muted }}>{d.name}</span>
+                          <span className="mono" style={{ color:d.color }}>{d.value}%</span>
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                ) : (
+                  <div style={{ height:160, display:"flex", alignItems:"center", justifyContent:"center", color:PALETTE.muted, fontSize:13 }}>No data yet</div>
+                )}
+              </div>
+            </div>
           )}
+
+          {/* Recent scans table */}
+          {total > 0 && (
+            <div className="glass" style={{ borderRadius:12, padding:24, marginBottom:32 }}>
+              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:20 }}>
+                <div style={{ fontSize:13, color:PALETTE.muted, letterSpacing:".06em", textTransform:"uppercase" }}>Recent Scans</div>
+                <span className="mono" style={{ fontSize:11, color:PALETTE.muted }}>{total} total</span>
+              </div>
+              <table>
+                <thead><tr><th>File</th><th>Risk Score</th><th>Status</th><th>Payload</th><th>Time</th></tr></thead>
+                <tbody>
+                  {[...scanHistory].reverse().slice(0, 10).map((r, i) => (
+                    <tr key={i} style={{ animation:`fadeUp .3s ${i*.04}s both`, opacity:0 }}>
+                      <td><span className="mono" style={{ color:PALETTE.text, fontSize:12 }}>{r.name}</span></td>
+                      <td>
+                        <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+                          <div className="progress-bar" style={{ width:80 }}>
+                            <div className="progress-fill" style={{ width:`${r.score}%`, background:scoreColor(r.score) }} />
+                          </div>
+                          <span className="mono" style={{ color:scoreColor(r.score), fontSize:12 }}>{r.score}%</span>
+                        </div>
+                      </td>
+                      <td><span className="tag" style={{ background:`${scoreColor(r.score)}22`, color:scoreColor(r.score) }}>{scoreLabel(r.score)}</span></td>
+                      <td>
+                        <span className="mono" style={{ fontSize:11, color:r.lsbPayload==="plaintext"?PALETTE.red:r.lsbPayload==="encrypted"?PALETTE.amber:PALETTE.muted }}>
+                          {r.lsbPayload==="plaintext"?"⚠ plaintext":r.lsbPayload==="encrypted"?"🔒 encrypted":"◎ none"}
+                        </span>
+                      </td>
+                      <td><span style={{ color:PALETTE.muted, fontSize:12 }}>{timeAgo(r.timestamp)}</span></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {/* ── Live Threat Intel Feed ── */}
+          <div className="glass" style={{ borderRadius:12, padding:24 }}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:20, flexWrap:"wrap", gap:10 }}>
+              <div>
+                <div style={{ fontSize:13, color:PALETTE.muted, letterSpacing:".06em", textTransform:"uppercase" }}>
+                  Live Threat Intelligence Feed
+                </div>
+                <div style={{ fontSize:12, color:PALETTE.muted, marginTop:3, opacity:.7 }}>
+                  Real-world steganography &amp; covert-channel incidents — powered by Claude web search
+                </div>
+              </div>
+              <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+                {intelTs && (
+                  <span className="mono" style={{ fontSize:10, color:PALETTE.muted }}>
+                    Updated {timeAgo(intelTs)}
+                  </span>
+                )}
+                <button
+                  className="btn-ghost"
+                  style={{ padding:"6px 14px", fontSize:11 }}
+                  onClick={fetchIntel}
+                  disabled={intel === "loading"}
+                >
+                  {intel === "loading" ? "Fetching…" : "↻ Refresh"}
+                </button>
+              </div>
+            </div>
+
+            {intel === null && (
+              <div style={{ padding:"32px 0", textAlign:"center" }}>
+                <div style={{ fontSize:13, color:PALETTE.muted, marginBottom:16 }}>Threat intel feed not loaded yet</div>
+                {getKey() ? (
+                  <button className="btn-primary" style={{ fontSize:13 }} onClick={fetchIntel}>Load Threat Feed →</button>
+                ) : (
+                  <div>
+                    <div style={{ fontSize:13, color:PALETTE.amber, marginBottom:8 }}>Set your API key (top-right) to enable live threat intel</div>
+                    <div style={{ fontSize:12, color:PALETTE.muted }}>LSB scanning works without a key — threat intel requires Claude API access</div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {intel === "loading" && (
+              <div style={{ padding:"32px 0" }}>
+                {[0,1,2,3].map(i => (
+                  <div key={i} style={{ display:"flex", gap:14, padding:"14px 0", borderBottom:i<3?`1px solid ${PALETTE.border}22`:"none", alignItems:"flex-start" }}>
+                    <div style={{ width:60, height:16, borderRadius:4, background:PALETTE.border, animation:"flicker 1.5s infinite", flexShrink:0 }} />
+                    <div style={{ flex:1 }}>
+                      <div style={{ height:13, borderRadius:4, background:PALETTE.border, marginBottom:8, width:"65%", animation:"flicker 1.5s infinite" }} />
+                      <div style={{ height:11, borderRadius:4, background:PALETTE.border, width:"90%", animation:"flicker 1.5s .2s infinite" }} />
+                    </div>
+                  </div>
+                ))}
+                <div style={{ display:"flex", alignItems:"center", gap:8, marginTop:14 }}>
+                  <div style={{ width:14, height:14, border:`2px solid ${PALETTE.blue}44`, borderTopColor:PALETTE.blue, borderRadius:"50%", animation:"spin-slow .8s linear infinite" }} />
+                  <span className="mono" style={{ fontSize:11, color:PALETTE.blue }}>Searching for latest steganography threats…</span>
+                </div>
+              </div>
+            )}
+
+            {intel === "no_key" && (
+              <div style={{ padding:"20px 0", textAlign:"center" }}>
+                <div style={{ fontSize:13, color:PALETTE.amber }}>No API key set — click the 🔓 indicator in the nav to add yours</div>
+              </div>
+            )}
+
+            {intel === "error" && (
+              <div style={{ padding:"20px 0", textAlign:"center" }}>
+                <div style={{ fontSize:13, color:PALETTE.red, marginBottom:8 }}>Failed to fetch threat intel</div>
+                <button className="btn-ghost" style={{ fontSize:12 }} onClick={fetchIntel}>Try Again</button>
+              </div>
+            )}
+
+            {Array.isArray(intel) && (
+              <div>
+                {intel.map((item, i) => (
+                  <div key={i} style={{
+                    display:"flex", gap:16, padding:"16px 0",
+                    borderBottom:i<intel.length-1?`1px solid ${PALETTE.border}22`:"none",
+                    animation:`fadeUp .4s ${i*.08}s both`, opacity:0,
+                  }}>
+                    {/* Severity pill */}
+                    <div style={{ flexShrink:0, paddingTop:2 }}>
+                      <span className="tag" style={{ background:`${sevColor(item.severity)}18`, color:sevColor(item.severity), fontSize:9, letterSpacing:".1em" }}>
+                        {sevLabel(item.severity)}
+                      </span>
+                    </div>
+                    {/* Content */}
+                    <div style={{ flex:1, minWidth:0 }}>
+                      <div style={{ fontSize:14, color:PALETTE.text, fontWeight:500, marginBottom:5, lineHeight:1.4 }}>{item.title}</div>
+                      <div style={{ fontSize:13, color:PALETTE.muted, lineHeight:1.6, marginBottom:6 }}>{item.summary}</div>
+                      <div style={{ display:"flex", gap:14 }}>
+                        <span className="mono" style={{ fontSize:10, color:PALETTE.blue }}>{item.source}</span>
+                        <span className="mono" style={{ fontSize:10, color:PALETTE.muted }}>{item.date}</span>
+                      </div>
+                    </div>
+                    {/* Threat indicator line */}
+                    <div style={{ flexShrink:0, width:3, borderRadius:2, background:sevColor(item.severity), opacity:.6, alignSelf:"stretch" }} />
+                  </div>
+                ))}
+                <div style={{ marginTop:14, fontSize:11, color:PALETTE.muted, display:"flex", alignItems:"center", gap:6 }}>
+                  <span style={{ width:6, height:6, borderRadius:"50%", background:PALETTE.green, display:"inline-block", animation:"blink 2s step-end infinite" }} />
+                  Live data retrieved via Claude web search
+                </div>
+              </div>
+            )}
+          </div>
         </div>
       );
     }
@@ -842,8 +1129,7 @@ High risk = 70-95, suspicious = 30-69, safe = 5-29.`;
         }
 
         try {
-          const base64 = image.split(",")[1];
-          const data = await analyzeWithClaude(base64, imageFile.name, ANTHROPIC_API_KEY);
+          const data = await analyzeWithClaude(image, imageFile.name);
           setResult(data);
           onScanComplete?.({ name:imageFile.name, score:data.riskScore, timestamp:Date.now(), lsbPayload:"none" });
         } catch {
@@ -903,8 +1189,10 @@ High risk = 70-95, suspicious = 30-69, safe = 5-29.`;
                   {extractResult.isReadable && <span className="tag" style={{ background:`${PALETTE.red}22`, color:PALETTE.red }}>⚠ PLAINTEXT PAYLOAD FOUND</span>}
                   {extractResult.isEncrypted && <span className="tag" style={{ background:`${PALETTE.amber}22`, color:PALETTE.amber }}>🔒 ENCRYPTED PAYLOAD DETECTED</span>}
                   {!extractResult.isReadable && !extractResult.isEncrypted && <span className="tag" style={{ background:`${PALETTE.muted}22`, color:PALETTE.muted }}>◎ NO STRUCTURED PAYLOAD</span>}
-                  <span className="tag" style={{ background:`${PALETTE.blue}18`, color:PALETTE.blue }}>Entropy: {extractResult.entropy} bits</span>
-                  <span className="tag" style={{ background:`${PALETTE.blue}18`, color:PALETTE.blue }}>Readable: {extractResult.readableRatio}%</span>
+                  {extractResult.isJpeg
+                    ? <span className="tag" style={{ background:`${PALETTE.muted}18`, color:PALETTE.muted }}>JPEG — chi-square N/A</span>
+                    : <span className="tag" style={{ background:`${PALETTE.blue}18`, color:PALETTE.blue }}>χ²: {extractResult.chiScore}</span>}
+                  {extractResult.isReadable && <span className="tag" style={{ background:`${PALETTE.green}18`, color:PALETTE.green }}>Run: {extractResult.readableRatio} chars</span>}
                 </div>
 
                 <div style={{ display:"flex", gap:2, marginBottom:14, background:"rgba(0,0,0,.3)", borderRadius:8, padding:3, width:"fit-content" }}>
@@ -937,7 +1225,7 @@ High risk = 70-95, suspicious = 30-69, safe = 5-29.`;
                         </div>
                         <div style={{ marginTop:12, padding:"10px 14px", background:`${PALETTE.amber}0D`, borderRadius:8, border:`1px solid ${PALETTE.amber}22` }}>
                           <div style={{ fontSize:12, color:PALETTE.amber, fontWeight:600, marginBottom:4 }}>🔒 Password-Protected Payload</div>
-                          <div style={{ fontSize:12, color:PALETTE.muted, lineHeight:1.6 }}>Byte entropy of <span className="mono" style={{ color:PALETTE.text }}>{extractResult.entropy}</span> bits indicates AES/cipher encryption. Use Dictionary Attack tab to attempt common passwords.</div>
+                          <div style={{ fontSize:12, color:PALETTE.muted, lineHeight:1.6 }}>Chi-square score of <span className="mono" style={{ color:PALETTE.text }}>{extractResult.chiScore}</span> indicates LSB pair equalisation — strong statistical evidence of steganographic embedding in this lossless image. Use Dictionary Attack to attempt decryption.</div>
                         </div>
                       </div>
                     ) : (
@@ -1171,17 +1459,31 @@ High risk = 70-95, suspicious = 30-69, safe = 5-29.`;
           setRows([...updatedRows]); setCurrentIdx(i);
           try {
             const dataUrl = await readFileAsDataURL(files[i]);
-            const lsb     = await extractLSB(dataUrl);
-            const score   = lsbToRiskScore(lsb);
-            updatedRows[i] = { name:files[i].name, status:"done", score, lsb };
+
+            // Run LSB extraction (always works, no API needed)
+            const lsb = await extractLSB(dataUrl);
+
+            let score;
+            // Try Claude API first (same as single scanner — most accurate)
+            try {
+              const aiResult = await analyzeWithClaude(dataUrl, files[i].name);
+              score = aiResult.riskScore;
+            } catch (apiErr) {
+              // API failed — fall back to LSB-only score
+              console.warn(`Bulk API failed for ${files[i].name}:`, apiErr.message);
+              score = lsbToRiskScore(lsb);
+            }
+
             const lsbPayload = lsb.isReadable ? "plaintext" : lsb.isEncrypted ? "encrypted" : "none";
+            updatedRows[i] = { name:files[i].name, status:"done", score, lsb };
             onScanComplete?.({ name:files[i].name, score, timestamp:Date.now(), lsbPayload });
           } catch {
             updatedRows[i] = { name:files[i].name, status:"done", score:5, lsb:null };
             onScanComplete?.({ name:files[i].name, score:5, timestamp:Date.now(), lsbPayload:"none" });
           }
           setRows([...updatedRows]);
-          await new Promise(r => setTimeout(r, 180));
+          // Small delay between API calls to avoid rate limiting
+          await new Promise(r => setTimeout(r, 400));
         }
         setScanning(false); setCurrentIdx(-1);
       };
